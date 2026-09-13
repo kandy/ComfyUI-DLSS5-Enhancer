@@ -1,4 +1,14 @@
-"""Lifecycle of one native DLSS 5 neural-rendering worker."""
+"""Lifecycle of one DLSS 5 neural-rendering worker.
+
+Two transports are supported:
+
+  * **Native in-process (Linux arm64)** -- ``NativeDlssSession`` from
+    :mod:`dlss5.native_backend` drives the CUDA binding in-process.  On Linux,
+    ``DlssSession.__new__`` returns one of these, and the base ``__init__``
+    detects it via ``isinstance`` and skips the Windows worker setup.
+  * **Windows pipe-worker (fallback)** -- the original ``nvngx.dll``
+    executable running ``--video`` on the ReShade carrier stack.
+"""
 
 from __future__ import annotations
 
@@ -31,14 +41,61 @@ def _preset_name(value: int) -> str:
 
 
 class DlssSession:
-    """A frame stream against the native feature-18 worker.
+    """A frame stream against the DLSS native renderer."""
 
-    The worker is started once per render, negotiates render/output sizes, then
-    consumes frames in order.  It must run with the runtime directory as its
-    working directory or the ReShade carrier will not load.
-    """
+    # ---- factory ------------------------------------------------------------
+    def __new__(cls, layout, options, *, input_width, input_height, frame_count):
+        """Factory: on Linux with the in-process CUDA binding available, construct
+        and return a ``NativeDlssSession`` (standalone class).  Because it is not
+        a subclass of ``DlssSession``, Python's ``type.__call__`` sees an
+        instance of a non-subclass and skips calling ``DlssSession.__init__``;
+        the native object is already fully initialised here."""
+        try:
+            from .native_backend import is_linux, is_available, NativeDlssSession
+            if is_linux() and is_available():
+                return NativeDlssSession(
+                    layout,
+                    options,
+                    input_width=input_width,
+                    input_height=input_height,
+                    frame_count=frame_count,
+                )
+        except Exception:
+            pass  # fall through to Windows pipe-worker
+        return object.__new__(cls)
 
+    # ---- init ---------------------------------------------------------------
     def __init__(
+        self,
+        layout: RuntimeLayout,
+        options: DlssOptions,
+        *,
+        input_width: int,
+        input_height: int,
+        frame_count: int,
+    ) -> None:
+        # Skip the Windows worker path when __new__ handed us the native
+        # class -- it runs its own __init__ (in native_backend.py).  Lazy
+        # import so we don't add a top-level circular import on module load.
+        try:
+            from .native_backend import NativeDlssSession
+            if isinstance(self, NativeDlssSession):
+                return
+        except Exception:
+            pass
+        self._init_worker(
+            layout,
+            options,
+            input_width=input_width,
+            input_height=input_height,
+            frame_count=frame_count,
+        )
+
+    # ------------------------------------------------------------------------
+    # Windows pipe-worker path (only used when native backend is unavailable)
+    # ------------------------------------------------------------------------
+
+    def _init_worker(
         self,
         layout: RuntimeLayout,
         options: DlssOptions,
@@ -60,7 +117,6 @@ class DlssSession:
         self._log_thread: threading.Thread | None = None
         self._closed = False
         self._frames_submitted = 0
-        # Filesystem timestamps can lag slightly behind the clock.
         self._started_at = time.time() - 1.0
 
         try:
@@ -91,8 +147,6 @@ class DlssSession:
         except BaseException:
             self.abort()
             raise
-
-    # -- setup ---------------------------------------------------------------
 
     def _handshake(self, frame_count: int) -> protocol.SetupResponse:
         native = self.options.native()
@@ -155,8 +209,7 @@ class DlssSession:
             )
         return setup
 
-    # -- properties ----------------------------------------------------------
-
+    # -- properties ------------------------------------------------------------
     @property
     def render_width(self) -> int:
         return self.setup.render_width
@@ -174,13 +227,7 @@ class DlssSession:
         return self._frames_submitted
 
     def reshade_log(self) -> str:
-        """Return this worker's ReShade output.
-
-        ReShade truncates the log when it initialises and only flushes it as the
-        process exits, so the file holds exactly one worker's output and is only
-        complete once that worker is gone. A log that was not touched since this
-        session started belongs to an earlier worker and is discarded.
-        """
+        """Return this worker's ReShade output (empty string on the native path)."""
         path = self.layout.reshade_log
         try:
             if path.stat().st_mtime < self._started_at:
@@ -190,21 +237,14 @@ class DlssSession:
             return ""
 
     def feature_report(self) -> dict[str, Any]:
-        """Prove that signed feature-18 execution really happened.
-
-        Only meaningful after :meth:`close`, because the log is written out when
-        the worker exits.
-        """
         if not self._closed:
             raise RuntimeError(
                 "The feature-18 report is only available after the session is closed."
             )
         return verify_feature_18(self.reshade_log())
 
-    # -- streaming -----------------------------------------------------------
-
+    # -- streaming -------------------------------------------------------------
     def _raise_worker_failure(self, index: int, cause: BaseException) -> NoReturn:
-        """Turn a dead worker into an actionable error and never return."""
         try:
             exit_code = self._worker.wait(timeout=10)
         except subprocess.TimeoutExpired:
@@ -243,8 +283,6 @@ class DlssSession:
                 protocol.read_exact(stdout, protocol.RESULT_HEADER.size)
             )
         except (EOFError, BrokenPipeError, OSError, RuntimeError) as exc:
-            # A dead worker shows up either as a broken stdin pipe or as EOF on
-            # stdout; both mean the same thing and deserve the same diagnosis.
             self._raise_worker_failure(index, exc)
 
         expected = self.output_width * self.output_height * 4
@@ -262,16 +300,12 @@ class DlssSession:
         try:
             protocol.read_into(stdout, output)
         except (EOFError, OSError) as exc:
-            # A large frame spans many pipe buffers, so this is where a mid frame
-            # crash usually surfaces.
             self._raise_worker_failure(index, exc)
         self._frames_submitted += 1
         return output, header.pts
 
-    # -- teardown ------------------------------------------------------------
-
+    # -- teardown ----------------------------------------------------------------
     def close(self) -> None:
-        """Finish the stream and require a clean worker exit."""
         if self._closed:
             return
         if self._worker.stdin and not self._worker.stdin.closed:
@@ -279,7 +313,6 @@ class DlssSession:
         try:
             exit_code = self._worker.wait(timeout=60)
         except subprocess.TimeoutExpired as exc:
-            # _closed stays false here so abort() below can still kill the worker.
             self.abort()
             raise RuntimeError(
                 "The native DLSS worker did not exit within 60 seconds and was killed."
@@ -306,7 +339,6 @@ class DlssSession:
                     pass
 
     def abort(self) -> None:
-        """Kill the worker without raising; used on cancellation and errors."""
         if self._closed:
             return
         self._closed = True
@@ -322,6 +354,7 @@ class DlssSession:
         self._close_pipes()
         self._join_log_thread()
 
+    # -- context manager ----------------------------------------------------------
     def __enter__(self) -> "DlssSession":
         return self
 

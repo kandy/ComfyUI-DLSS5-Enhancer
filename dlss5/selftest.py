@@ -42,14 +42,25 @@ def main() -> int:
     parser.add_argument("--runtime-dir", default=None)
     arguments = parser.parse_args()
 
-    layout = find_runtime(arguments.runtime_dir)
-    print(f"runtime      : {layout.root}")
-    print(f"worker       : {layout.worker}")
-    gpu = detect_gpu()
-    print(f"gpu          : {gpu['name']} (driver {gpu['driver']}, gen {gpu['generation']})")
-    bundle = inspect_bundle(layout)
-    print(f"addon sha256 : {bundle['addon_sha256']}")
-    print(f"neural sha256: {bundle['neural_sha256']}")
+    import platform as _platform
+
+    from . import native_backend as _native_backend
+
+    native = (
+        _platform.system().lower() == "linux" and _native_backend.is_available()
+    )
+    layout = None
+    if native:
+        print("backend      : native in-process DLSS-SR (NVSDK_NGX_CUDA)")
+    else:
+        layout = find_runtime(arguments.runtime_dir)
+        print(f"runtime      : {layout.root}")
+        print(f"worker       : {layout.worker}")
+        gpu = detect_gpu()
+        print(f"gpu          : {gpu['name']} (driver {gpu['driver']}, gen {gpu['generation']})")
+        bundle = inspect_bundle(layout)
+        print(f"addon sha256 : {bundle['addon_sha256']}")
+        print(f"neural sha256: {bundle['neural_sha256']}")
 
     options = DlssOptions.create(upscaling_mode=arguments.mode)
     with DlssSession(

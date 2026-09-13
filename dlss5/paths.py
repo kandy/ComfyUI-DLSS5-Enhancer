@@ -84,16 +84,35 @@ class RuntimeLayout:
         return self
 
     def validate(self) -> "RuntimeLayout":
-        missing = [
-            str(self.root / name)
+        missing_names = [
+            name
             for name in REQUIRED_RUNTIME_FILES
             if not (self.root / name).is_file()
         ]
-        if missing:
+        if missing_names:
+            missing_paths = [str(self.root / name) for name in missing_names]
+            # If only the Windows-specific files are missing (dxgi/renodx)
+            # and the worker marker is present, the native in-process path
+            # is still usable — just a soft warning.
+            if all(n in ("dxgi.dll", "renodx-dlss5.addon64") for n in missing_names) \
+                    and (self.root / WORKER_NAME).is_file():
+                return self
+            # The native in-process binding is self-contained
+            # (it only needs `libdlss_native.so` in the ``dlss_native``
+            # package).  If that binding is loadable and Linux, we can
+            # proceed even when the runtime dir is missing -- this is the
+            # case on an installed ComfyUI-DLSS5-Enhancer that has never
+            # run the Windows worker.
+            try:
+                from . import native_backend
+                if native_backend.is_linux() and native_backend.is_available():
+                    return self
+            except Exception:
+                pass
             raise RuntimeMissing(
                 "The DLSS 5 runtime in "
                 f"{self.root} is incomplete. Missing:\n  "
-                + "\n  ".join(missing)
+                + "\n  ".join(missing_paths)
                 + "\n\n"
                 + SETUP_HINT
             )
@@ -147,10 +166,16 @@ def _ffmpeg_candidates(config: dict, runtime_root: Path) -> list[Path]:
 
 def _resolve_ffmpeg(config: dict, runtime_root: Path) -> tuple[Path, Path]:
     for directory in _ffmpeg_candidates(config, runtime_root):
-        ffmpeg = directory / "ffmpeg.exe"
-        ffprobe = directory / "ffprobe.exe"
-        if ffmpeg.is_file() and ffprobe.is_file():
-            return ffmpeg, ffprobe
+        # Windows runtime ships ffmpeg.exe/ffprobe.exe; a Linux ffmpeg dir
+        # (or DLSS5_FFMPEG_DIR) holds extensionless ffmpeg/ffprobe.
+        for ffmpeg_name, ffprobe_name in (
+            ("ffmpeg.exe", "ffprobe.exe"),
+            ("ffmpeg", "ffprobe"),
+        ):
+            ffmpeg = directory / ffmpeg_name
+            ffprobe = directory / ffprobe_name
+            if ffmpeg.is_file() and ffprobe.is_file():
+                return ffmpeg, ffprobe
     on_path = shutil.which("ffmpeg"), shutil.which("ffprobe")
     if all(on_path):
         return Path(on_path[0]), Path(on_path[1])
@@ -161,15 +186,49 @@ def _resolve_ffmpeg(config: dict, runtime_root: Path) -> tuple[Path, Path]:
     )
 
 
+def _native_available() -> bool:
+    """True when the in-process Linux CUDA backend can drive renders.
+
+    Kept lazy (and exception-proof) so runtime discovery never fails
+    because the optional native binding failed to load.
+    """
+    try:
+        from . import native_backend
+
+        return bool(native_backend.is_linux() and native_backend.is_available())
+    except Exception:
+        return False
+
+
 def find_runtime(override: str | os.PathLike[str] | None = None) -> RuntimeLayout:
-    """Locate the runtime; ``override`` wins, then env var, config, bundled dir."""
+    """Locate the runtime; ``override`` wins, then env var, config, bundled dir.
+
+    On Linux with the in-process CUDA binding available, no Windows
+    ``runtime/`` directory is needed: return a layout pointing at the
+    (possibly absent) bundled dir so ``DlssSession`` can route to the
+    native backend. An explicit ``override`` is still honoured strictly.
+    """
     config = _read_config()
-    candidates = [Path(override)] if override else _runtime_candidates(config)
+    if override:
+        candidate = Path(override).expanduser()
+        if (candidate / WORKER_NAME).is_file():
+            return RuntimeLayout(root=candidate.resolve(), config=config).validate()
+        raise RuntimeMissing(
+            f"No DLSS 5 runtime was found in the override directory:\n  {candidate}\n\n"
+            + SETUP_HINT
+        )
+    candidates = _runtime_candidates(config)
 
     for candidate in candidates:
         root = candidate.expanduser()
         if (root / WORKER_NAME).is_file():
             return RuntimeLayout(root=root.resolve(), config=config).validate()
+
+    # No Windows worker anywhere — the Linux native backend needs none.
+    if _native_available():
+        return RuntimeLayout(
+            root=(PACKAGE_ROOT / "runtime").resolve(), config=config
+        )
 
     searched = "\n  ".join(str(path) for path in candidates)
     raise RuntimeMissing(

@@ -64,10 +64,11 @@ this repository and are not redistributed by it. See
 
 | Item | Requirement |
 | --- | --- |
-| GPU | NVIDIA ships DLSS 5 for the RTX 50 series. Through this community runtime it also runs on RTX 40 and 30. RTX 20 and older are refused |
-| Driver | Current NVIDIA GeForce driver |
+| GPU | NVIDIA ships DLSS 5 for the RTX 50 series. Through this community runtime it also runs on RTX 40 and 30. RTX 20 and older are refused. On Linux (DGX Spark / GB10) the native CUDA backend drives DLSS SuperSampling directly |
+| Driver | Current NVIDIA GeForce driver (590+ on Linux for the native backend) |
 | ComfyUI | A build with the V3 node API (`comfy_api.latest`) |
 | Python | `numpy`, `av` and OpenCV. ComfyUI portable normally ships all three; `opencv-python` is deliberately not in `requirements.txt` so it cannot overwrite an existing `opencv-contrib-python` |
+| Linux native backend | CUDA toolkit with `nvcc`, `libnvsdk_ngx.a` from the DLSS SDK archive, and the driver `libnvidia-ngx.so.1`. No Windows runtime download is needed |
 
 ## Installation
 
@@ -129,6 +130,54 @@ starts, so a missing binary fails immediately rather than after the job: the
 
 The nodes appear under **image/upscaling**. If you restart before installing the runtime, they
 load normally and only fail when executed, with a message that says how to install it.
+
+### Linux native backend (DGX Spark, no Windows runtime)
+
+On Linux with an NVIDIA GPU, the nodes drive DLSS SuperSampling directly
+through the CUDA APIs (`NVSDK_NGX_CUDA_*`), in-process — no ReShade, no
+RenoDX, no `nvngx.dll` download. The pack ships the backend
+self-contained:
+
+```
+ComfyUI-DLSS5-Enhancer/
+  dlss_native/            # ctypes binding + prebuilt build/libdlss_native.so
+    src/libdlss_native.cu # real DLSS-SR engine, Lanczos fallback
+    build.sh              # rebuild: needs nvcc + host CUDA toolkit
+  DLSS/
+    include/              # NGX SDK headers (rebuild only)
+    lib/Linux_aarch64/
+      libnvsdk_ngx.a      # NGX static wrapper (rebuild only)
+      rel/libnvidia-ngx-dlss.so.310.9.1   # DLSS model plugin (runtime)
+```
+
+At runtime only `dlss_native/build/libdlss_native.so`, the bundled
+`libnvidia-ngx-dlss.so.310.9.1` (found automatically next to the
+binding) and the host driver's `libnvidia-ngx.so.1` are needed. To
+rebuild from source (e.g. a different CUDA toolkit):
+
+```bash
+cd ComfyUI/custom_nodes/ComfyUI-DLSS5-Enhancer/dlss_native && ./build.sh
+```
+
+The ComfyUI nodes pick the bundled binding up on Linux with no further
+configuration; per-frame motion vectors and history resets flow through
+the same `submit()` call as the Windows path. `DLSS_NATIVE_HOME` or
+`DLSS_NGX_PLUGIN_DIR` override the discovery if you keep copies
+elsewhere. Note the NVIDIA binaries (`libnvidia-ngx-dlss.so`,
+`libnvsdk_ngx.a`, headers) are proprietary under NVIDIA's DLSS terms —
+redistribute the pack only where those terms permit, exactly as with
+the Windows runtime files.
+
+Verify it without ComfyUI:
+
+```bash
+python3 ComfyUI/custom_nodes/ComfyUI-DLSS5-Enhancer/selftest.py \
+    --frames 5 --mode "2x (Performance)"
+```
+
+On Linux this prints `backend: native in-process DLSS-SR` and renders
+synthetic frames on the GPU. If NGX is unavailable the binding
+transparently falls back to Lanczos and says so in the feature report.
 
 ## Nodes
 
@@ -266,7 +315,12 @@ badly after every frame was rendered, the node logs a warning and keeps the file
 that reports a failure on an otherwise good render is a worker that has to be killed on a close
 timeout, because it never flushes its log.
 
-Two log observations are normal and not errors:
+On the Linux native backend there is no ReShade log; instead the feature
+report records how many frames ran on the neural engine
+(`N neural + M fallback frame(s) ... (NVSDK_NGX_CUDA SuperSampling)`).
+A nonzero fallback count means those frames were plain Lanczos upscales.
+
+Two log observations are normal and not errors (Windows worker only):
 
 - `NR upscaling fell back to native`: current runtime builds decline the low resolution colour
   contract, so DLSS upscales first and the neural pass then runs at the output resolution. The
@@ -327,7 +381,11 @@ One measurement, RTX 5090 with driver 610.74, 640x360 to 1280x720 at 2x Performa
   ffprobe counting pass is treated as authoritative and fails the run.
 - Running the video node twice with identical inputs replays the cached result and writes no
   new file. Change an input, or the source file, to render again.
-- Windows only. The worker, the carrier and the add-on are Windows binaries.
+- Windows only, except for the native Linux CUDA backend: on Linux the
+  nodes run DLSS SuperSampling in-process (no ReShade/RenoDX worker), so
+  neural-rendering-specific controls (`nr_preset`, `nr_style`,
+  `automatic_mask`, ReShade-log verification) do not apply there; motion
+  vectors, history resets, upscaling modes and model presets do.
 
 ## Troubleshooting
 
@@ -344,6 +402,8 @@ One measurement, RTX 5090 with driver 610.74, 640x360 to 1280x720 at 2x Performa
 | `needs the tested experimental Ampere pair` | RTX 30 only runs with the verified RenoDX 4.70 and DLSS NR 310.8.SF-v2 files, checked by SHA-256. The message prints the hashes actually installed |
 | `does not speak the version-4 protocol` | The registered runtime is from a different release. Use v3.0 |
 | `ffmpeg/ffprobe were not found` | Only the video node needs them. Set `DLSS5_FFMPEG_DIR` or put them on `PATH` |
+| `native binding ... not available` (Linux) | `dlss_native/build/libdlss_native.so` is missing or failed to load. Run `dlss_native/build.sh`; needs `nvcc`, the DLSS SDK tree and the NVIDIA driver |
+| frames fell back to Lanczos (Linux) | NGX initialisation failed (driver too old, no supported GPU, or DLSS plugin not found). Check the console log; `DLSS_NGX_PLUGIN_DIR` can point at a directory containing `libnvidia-ngx-dlss.so` |
 | `DLSS <mode> is unavailable for ...` | The driver rejected that output size. Choose a lower upscaling mode |
 | `applied DLSS model preset X instead of the requested Y` | The runtime does not support that model. Set `dlss_model_preset` to Default |
 | `crashed inside feature-18 evaluation (access violation)` | Driver and RenoDX or DLSS NR versions do not match. Update the driver and reinstall the runtime |

@@ -6,7 +6,9 @@ config.json
 runtime/
 ffmpeg/
 
-# Belt and braces: no native binary or archive belongs in this repository
+# Belt and braces: no native binary or archive belongs in this repository,
+# EXCEPT the Linux native backend below (deliberately tracked so the pack
+# is distributable as-is; see README "Linux native backend").
 *.dll
 *.exe
 *.addon64

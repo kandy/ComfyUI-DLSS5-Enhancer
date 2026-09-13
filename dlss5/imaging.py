@@ -3,12 +3,24 @@
 from __future__ import annotations
 
 import numpy as np
-import torch
+
+try:
+    import torch
+except ImportError:  # selftest/native path may run without ComfyUI's torch
+    torch = None  # type: ignore[assignment]
 
 try:
     import cv2
 except ImportError:  # reported when a node runs, not by hiding every node
     cv2 = None
+
+
+def require_torch() -> None:
+    if torch is None:
+        raise RuntimeError(
+            "PyTorch is required for tensor conversion. "
+            "Install torch, or run inside ComfyUI."
+        )
 
 
 def require_cv2() -> None:
@@ -41,6 +53,7 @@ def fit_frame(rgba: np.ndarray, width: int, height: int) -> np.ndarray:
 
 def tensor_to_rgba(frame: torch.Tensor) -> np.ndarray:
     """Convert one (H, W, C) float image in 0..1 to a contiguous RGBA8 array."""
+    require_torch()
     array = frame.detach().to(device="cpu", dtype=torch.float32).clamp(0.0, 1.0).numpy()
     array = np.rint(array * 255.0).astype(np.uint8)
     channels = array.shape[2]
@@ -59,6 +72,7 @@ def tensor_to_rgba(frame: torch.Tensor) -> np.ndarray:
 
 def rgba_to_tensor(rgba: np.ndarray, *, keep_alpha: bool) -> torch.Tensor:
     """Convert an RGBA8 worker result back to a float image in 0..1."""
+    require_torch()
     channels = 4 if keep_alpha else 3
     array = np.ascontiguousarray(rgba[..., :channels], dtype=np.float32) / 255.0
     return torch.from_numpy(array)

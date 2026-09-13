@@ -1,0 +1,34 @@
+"""Native in-process DLSS upscaler for Linux (arm64/aarch64, CUDA)."""
+from ._native import (
+    DLSS_OK,
+    DLSS_ERR_BAD_INPUT,
+    DLSS_ERR_NOT_INIT,
+    DLSS_ERR_CUDA,
+    DLSS_ERR_OOM,
+    SCALE_FACTORS,
+    QUALITY_FOR_FACTOR,
+    DLSSRuntimeError,
+    NativeDLSS,
+    is_available,
+    last_error,
+    last_path,
+    supported_scale,
+    upscale,
+)
+
+__all__ = [
+    "DLSS_OK",
+    "DLSS_ERR_BAD_INPUT",
+    "DLSS_ERR_NOT_INIT",
+    "DLSS_ERR_CUDA",
+    "DLSS_ERR_OOM",
+    "SCALE_FACTORS",
+    "QUALITY_FOR_FACTOR",
+    "DLSSRuntimeError",
+    "NativeDLSS",
+    "is_available",
+    "last_error",
+    "last_path",
+    "supported_scale",
+    "upscale",
+]

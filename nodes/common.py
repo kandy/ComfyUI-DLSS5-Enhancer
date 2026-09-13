@@ -25,7 +25,15 @@ def confirm_feature_18(session: DlssSession, enabled: bool) -> None:
     if not enabled:
         return
     report = session.feature_report()
-    if report["native_fallback"]:
+    if report["native_fallback"] and report.get("backend") == "native_inprocess":
+        # Linux native backend: fallback means plain Lanczos upscaling with
+        # no neural pass (e.g. NGX unavailable). Loud, but non-fatal.
+        logger.warning(
+            "DLSS5: %d frame(s) fell back to Lanczos upscaling without "
+            "neural rendering; check the NGX driver installation.",
+            session.frames_submitted,
+        )
+    elif report["native_fallback"]:
         # Expected on current runtime builds: DLSS upscales first, then the
         # neural pass runs at the output resolution instead of inside the
         # upscaler. Neural rendering still happened.

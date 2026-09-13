@@ -140,6 +140,29 @@ def detect_gpu() -> dict[str, Any]:
             "generation": generation,
             "beta": generation == 30,
         }
+
+    # No RTX-named device.  On the native in-process path (Linux arm64, GB10 /
+    # Blackwell) the GPU is not named "RTX <n>" -- accept any NVIDIA device with
+    # a modern compute capability (>= 8.0) so the selftest and the Windows
+    # path both work on this hardware.
+    for line in result.stdout.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 4:
+            continue
+        name, driver, memory, capability = parts[:4]
+        mcap = re.search(r"(\d+)\.(\d+)", capability)
+        if not mcap:
+            continue
+        major = int(mcap.group(1))
+        if major >= 8:
+            return {
+                "name": name,
+                "driver": driver,
+                "memory_mb": int(memory) if str(memory).isdigit() else 0,
+                "compute_capability": capability,
+                "generation": major * 10,  # e.g. 12.0 -> 120
+                "beta": False,
+            }
     raise RuntimeError("No supported NVIDIA RTX GPU was detected.")
 
 
@@ -152,14 +175,21 @@ def file_sha256(path: Path) -> str:
 
 
 def inspect_bundle(layout: RuntimeLayout) -> dict[str, Any]:
-    """Fingerprint the neural components so failures can name what is installed."""
-    addon = file_sha256(layout.addon)
-    neural = file_sha256(layout.neural_runtime)
+    """Fingerprint the neural components so failures can name what is installed.
+
+    On the native in-process path the ReShade add-on / neural DLL may be
+    absent -- hash the files that exist and report the rest as empty so the
+    selftest and failure messages don't crash on a Linux install.
+    """
+    addon = file_sha256(layout.addon) if layout.addon.is_file() else ""
+    neural = file_sha256(layout.neural_runtime) if layout.neural_runtime.is_file() else ""
     return {
         "addon_sha256": addon,
         "neural_sha256": neural,
         "known_ampere_pair": (
-            addon == EXPECTED_AMPERE_ADDON_SHA256 and neural == EXPECTED_AMPERE_NEURAL_SHA256
+            bool(neural)
+            and addon == EXPECTED_AMPERE_ADDON_SHA256
+            and neural == EXPECTED_AMPERE_NEURAL_SHA256
         ),
     }
 
