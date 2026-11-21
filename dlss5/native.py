@@ -33,9 +33,21 @@ def _candidate_dirs() -> list[str]:
 
 
 def _ensure_importable() -> None:
+    """Put the highest-priority copy of ``dlss_native`` first on sys.path.
+
+    Candidates are ordered plugin-local pack first, then the dev workspace.
+    Inserting every fallback at position 0 would let the *last* candidate win,
+    so the final order is rebuilt explicitly.
+    """
+    present: list[str] = []
     for d in _candidate_dirs():
-        if d and Path(d, "dlss_native", "__init__.py").is_file() and d not in sys.path:
-            sys.path.insert(0, d)
+        if d and Path(d, "dlss_native", "__init__.py").is_file() and d not in present:
+            present.append(d)
+    for d in present:
+        while d in sys.path:
+            sys.path.remove(d)
+    for d in reversed(present):
+        sys.path.insert(0, d)
 
 
 def load() -> ModuleType:

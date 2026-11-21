@@ -98,6 +98,27 @@ def main() -> int:
     print(f"feature 18   : verified, native fallback={report['native_fallback']}")
     for line in report["evidence"]:
         print(f"  {line}")
+
+    # Frame interpolation uses the driver's optical-flow engine; keep it a
+    # separate, non-fatal probe so an SR-only setup still passes the test.
+    try:
+        from .interpolation import FrameInterpolator
+
+        prev2 = _synthetic_frame(arguments.width, arguments.height, 0)
+        prev = _synthetic_frame(arguments.width, arguments.height, 1)
+        nxt = _synthetic_frame(arguments.width, arguments.height, 2)
+        interpolator = FrameInterpolator(refine=True)
+        try:
+            mids = interpolator.between(prev, nxt, 2, prev2=prev2)
+            print(
+                f"interpolation: 2x -> {len(mids)} frame(s), "
+                f"order={interpolator.order} path={interpolator.path} "
+                f"({interpolator.describe()})"
+            )
+        finally:
+            interpolator.close()
+    except Exception as exc:  # noqa: BLE001 -- probe only
+        print(f"interpolation: unavailable ({exc})")
     return 0
 
 

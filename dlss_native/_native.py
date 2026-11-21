@@ -25,13 +25,18 @@ import numpy as np
 __all__ = [
     "NativeDLSS",
     "upscale",
+    "interpolate",
     "is_available",
+    "interp_available",
     "last_error",
     "supported_scale",
     "last_path",
+    "interp_last_path",
+    "interp_last_order",
     "DLSS_OK",
     "SCALE_FACTORS",
     "QUALITY_FOR_FACTOR",
+    "MAX_INTERP_FRAMES",
 ]
 
 # NVSDK_NGX_PerfQuality_Value per ComfyUI scale factor (mirrors the
@@ -53,6 +58,9 @@ DLSS_ERR_OOM = ctypes.c_int32(0xBAD0000D).value
 
 # Scale factors exposed by the worker (x1000), matching ComfyUI-DLSS5-Enhancer.
 SCALE_FACTORS = (1000, 1500, 1724, 2000, 3000)
+
+# Most intermediate frames generated between one pair (4x total).
+MAX_INTERP_FRAMES = 3
 
 _LIB_NAME = "libdlss_native.so"
 
@@ -80,11 +88,36 @@ def _find_library() -> Path:
 
 
 _LIB = None
+# NativeDLSS instances share the CUDA/NGX globals in the .so. NVIDIA's NGX
+# CUDA loader stages libnvidia-ngx-dlss.so into a /tmp file on every
+# NVSDK_NGX_CUDA_Init and never releases that descriptor when
+# NVSDK_NGX_CUDA_Shutdown() runs. Calling shutdown after each node execution
+# therefore leaked one fd (and a ~59 MB mapping) per run until the process hit
+# RLIMIT_NOFILE. Keep the engine initialised once for the process lifetime
+# instead; dlss_init() is already idempotent. Set DLSS_NATIVE_TEARDOWN=1 to
+# restore the old per-session shutdown.
+_SESSIONS = 0
+_KEEP_ALIVE = os.environ.get("DLSS_NATIVE_TEARDOWN", "").strip().lower() not in (
+    "1", "true", "yes", "on",
+)
+
+
+def _raise_fd_limit() -> None:
+    # Headroom for any other descriptor a native library may leak.
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if hard != resource.RLIM_INFINITY and soft < hard:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+    except (ImportError, ValueError, OSError):
+        pass
 
 
 def _lib() -> ctypes.CDLL:
     global _LIB
     if _LIB is None:
+        _raise_fd_limit()
         path = _find_library()
         _LIB = ctypes.CDLL(str(path))
         _setup_proto(_LIB)
@@ -121,6 +154,27 @@ def _setup_proto(L: ctypes.CDLL) -> None:
     L.dlss_last_path.argtypes = []
     L.dlss_get_last_error.restype = ctypes.c_int32
     L.dlss_get_last_error.argtypes = [ctypes.c_char_p, ctypes.c_int32]
+    L.dlss_interpolate_available.restype = ctypes.c_int32
+    L.dlss_interpolate_available.argtypes = []
+    L.dlss_interp_last_path.restype = ctypes.c_int32
+    L.dlss_interp_last_path.argtypes = []
+    L.dlss_interpolate_rgba.restype = ctypes.c_int32
+    L.dlss_interpolate_rgba.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32,
+        ctypes.c_int32, ctypes.c_int32, ctypes.c_void_p,
+    ]
+    # Added with the three-frame trajectory path; tolerate an older .so so a
+    # stale build still works with pairwise interpolation.
+    if hasattr(L, "dlss_interp_last_order"):
+        L.dlss_interp_last_order.restype = ctypes.c_int32
+        L.dlss_interp_last_order.argtypes = []
+    if hasattr(L, "dlss_interpolate_rgba_3f"):
+        L.dlss_interpolate_rgba_3f.restype = ctypes.c_int32
+        L.dlss_interpolate_rgba_3f.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int32, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32,
+            ctypes.c_void_p,
+        ]
 
 
 def _cstr(L: ctypes.CDLL) -> str:
@@ -150,14 +204,23 @@ class NativeDLSS:
     """
 
     def __init__(self, app_id: int = 0xDEADEAF) -> None:
+        global _SESSIONS
         L = _lib()
         rc = L.dlss_init(app_id)
         if rc != DLSS_OK:
             raise DLSSRuntimeError(rc, _cstr(L))
+        _SESSIONS += 1
+        self._closed = False
 
     def close(self) -> None:
-        L = _lib()
-        L.dlss_shutdown()
+        global _SESSIONS
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        if _SESSIONS > 0:
+            _SESSIONS -= 1
+        if _SESSIONS == 0 and not _KEEP_ALIVE:
+            _lib().dlss_shutdown()
 
     def __enter__(self) -> "NativeDLSS":
         return self
@@ -256,6 +319,79 @@ class NativeDLSS:
             raise DLSSRuntimeError(rc, _cstr(L))
         return out
 
+    # -- frame interpolation ------------------------------------------------
+    def interp_available(self) -> bool:
+        return bool(_lib().dlss_interpolate_available())
+
+    def interp_last_path(self) -> str:
+        return "optical_flow" if _lib().dlss_interp_last_path() else "blend"
+
+    def interp_last_order(self) -> int:
+        """Trajectory order of the last call: 2, 1, or 0 for cross-fade."""
+        last_order = getattr(_lib(), "dlss_interp_last_order", None)
+        if last_order is None:
+            return 1 if self.interp_last_path() == "optical_flow" else 0
+        return int(last_order())
+
+    def interpolate(
+        self,
+        prev: np.ndarray,
+        next: np.ndarray,
+        count: int = 1,
+        refine: bool = True,
+        prev2: np.ndarray | None = None,
+    ) -> list[np.ndarray]:
+        """Synthesise ``count`` frames between ``prev`` and ``next``.
+
+        Uses the NVIDIA Optical Flow Accelerator to warp both frames to the
+        intermediate time (with forward/backward consistency weighting), then
+        optionally runs each result through the DLSS neural engine (DLAA at
+        1x). When ``prev2`` is supplied, the trajectory is fitted through
+        ``prev2 -> prev -> next`` (central-difference velocity plus second
+        difference acceleration), so accelerating or curved motion is followed
+        instead of assuming constant pairwise velocity. Returns frames in
+        temporal order (``count`` items).
+        """
+        if not 1 <= int(count) <= MAX_INTERP_FRAMES:
+            raise ValueError(f"count must be between 1 and {MAX_INTERP_FRAMES}")
+        prev = np.ascontiguousarray(prev, dtype=np.uint8)
+        next = np.ascontiguousarray(next, dtype=np.uint8)
+        if prev.ndim != 3 or prev.shape[2] != 4:
+            raise ValueError(f"expected HxWx4 RGBA for prev, got {prev.shape}")
+        if next.shape != prev.shape:
+            raise ValueError(
+                f"prev and next must have the same shape, got {prev.shape} and {next.shape}"
+            )
+        if prev2 is not None:
+            prev2 = np.ascontiguousarray(prev2, dtype=np.uint8)
+            if prev2.shape != prev.shape:
+                raise ValueError(
+                    "prev2, prev and next must have the same shape, got "
+                    f"{prev2.shape}, {prev.shape} and {next.shape}"
+                )
+        h, w = prev.shape[:2]
+        out = np.empty((int(count), h, w, 4), dtype=np.uint8)
+        L = _lib()
+        use_three_frame = prev2 is not None and hasattr(L, "dlss_interpolate_rgba_3f")
+        if use_three_frame:
+            rc = L.dlss_interpolate_rgba_3f(
+                ctypes.c_void_p(prev2.ctypes.data),
+                ctypes.c_void_p(prev.ctypes.data),
+                ctypes.c_void_p(next.ctypes.data),
+                int(w), int(h), int(count), int(bool(refine)),
+                ctypes.c_void_p(out.ctypes.data),
+            )
+        else:
+            rc = L.dlss_interpolate_rgba(
+                ctypes.c_void_p(prev.ctypes.data),
+                ctypes.c_void_p(next.ctypes.data),
+                int(w), int(h), int(count), int(bool(refine)),
+                ctypes.c_void_p(out.ctypes.data),
+            )
+        if rc != DLSS_OK:
+            raise DLSSRuntimeError(rc, _cstr(L))
+        return [np.ascontiguousarray(out[i]) for i in range(int(count))]
+
 
 # ---- convenience module-level API -------------------------------------------
 def is_available() -> bool:
@@ -276,6 +412,39 @@ def supported_scale(factor_x1000: int) -> bool:
 def last_path() -> str:
     """Which engine rendered the last frame: ``"neural"`` or ``"fallback"``."""
     return "neural" if _lib().dlss_last_path() else "fallback"
+
+
+def interp_available() -> bool:
+    """True when the NVIDIA Optical Flow Accelerator is usable."""
+    return bool(_lib().dlss_interpolate_available())
+
+
+def interp_last_path() -> str:
+    """Engine behind the last interpolation: ``"optical_flow"`` or ``"blend"``."""
+    return "optical_flow" if _lib().dlss_interp_last_path() else "blend"
+
+
+def interp_last_order() -> int:
+    """Trajectory order of the last interpolation: 2, 1, or 0 for cross-fade."""
+    return NativeDLSS.__new__(NativeDLSS).interp_last_order()
+
+
+def interpolate(
+    prev: np.ndarray,
+    next: np.ndarray,
+    count: int = 1,
+    refine: bool = True,
+    prev2: np.ndarray | None = None,
+) -> list[np.ndarray]:
+    """One-shot frame interpolation (initialises + runs the CUDA engine)."""
+    L = _lib()
+    if not L.dlss_is_available():
+        rc = L.dlss_init(0xDEADEAF)
+        if rc != DLSS_OK:
+            raise DLSSRuntimeError(rc, _cstr(L))
+    return NativeDLSS.__new__(NativeDLSS).interpolate(
+        prev, next, count=count, refine=refine, prev2=prev2
+    )
 
 
 def upscale(rgba: np.ndarray, factor: float = 2.0) -> np.ndarray:

@@ -13,6 +13,12 @@ from comfy.model_management import throw_exception_if_processing_interrupted
 from comfy.utils import ProgressBar
 
 from ..dlss5.imaging import fit_frame
+from ..dlss5.interpolation import (
+    INTERPOLATION_CHOICES,
+    FrameInterpolator,
+    interpolated_timeline,
+    resolve_factor,
+)
 from ..dlss5.media import (
     CODECS,
     CONTAINER_EXTENSIONS,
@@ -183,6 +189,27 @@ class DLSS5EnhanceVideoFile(io.ComfyNode):
                         "result. Chapters and metadata are kept either way."
                     ),
                 ),
+                io.Combo.Input(
+                    "frame_interpolation",
+                    options=list(INTERPOLATION_CHOICES),
+                    default="Off",
+                    tooltip=(
+                        "Synthesise extra frames with the NVIDIA Optical Flow "
+                        "Accelerator. 2x/3x/4x doubles, triples or quadruples the frame "
+                        "count; the output rate is multiplied while the clip still "
+                        "ends on the last source frame. Timestamps and audio are "
+                        "scaled to match."
+                    ),
+                ),
+                io.Boolean.Input(
+                    "interpolation_neural_refine",
+                    default=True,
+                    tooltip=(
+                        "Run each synthesised frame through the DLSS neural engine "
+                        "(DLAA at 1x). Ignored when frame_interpolation is Off."
+                    ),
+                    advanced=True,
+                ),
                 io.Boolean.Input(
                     "verify_neural_rendering",
                     default=True,
@@ -224,6 +251,8 @@ class DLSS5EnhanceVideoFile(io.ComfyNode):
         output_directory: str,
         max_frames: int,
         copy_audio: bool,
+        frame_interpolation: str = "Off",
+        interpolation_neural_refine: bool = True,
         verify_neural_rendering: bool = True,
     ) -> io.NodeOutput:
         if not video_path.strip():
@@ -272,6 +301,7 @@ class DLSS5EnhanceVideoFile(io.ComfyNode):
             Path(folder_paths.get_temp_directory()), f"{final_path.stem}_raw", ".mkv"
         )
 
+        interpolation_factor = resolve_factor(frame_interpolation)
         try:
             written, session = cls._render(
                 layout=layout,
@@ -283,6 +313,8 @@ class DLSS5EnhanceVideoFile(io.ComfyNode):
                 counted_exactly=counted_exactly,
                 codec=codec,
                 quality=quality,
+                interpolation_factor=interpolation_factor,
+                interpolation_refine=bool(interpolation_neural_refine),
             )
             try:
                 mux(layout, rendered_path, source, final_path, container, copy_audio=copy_audio)
@@ -316,6 +348,8 @@ class DLSS5EnhanceVideoFile(io.ComfyNode):
         counted_exactly: bool,
         codec: str,
         quality: str,
+        interpolation_factor: int = 1,
+        interpolation_refine: bool = True,
     ):
         """Decode, render and encode concurrently. Returns (frames, session)."""
         session = DlssSession(
@@ -331,6 +365,12 @@ class DLSS5EnhanceVideoFile(io.ComfyNode):
         stop = threading.Event()
         errors: queue.Queue = queue.Queue()
 
+        # Interpolation raises the output frame rate while the new time base
+        # keeps every timestamp in place, so the clip still ends on the last
+        # source frame (duration matches to within one source frame).
+        output_rate = metadata["rate"] * interpolation_factor
+        output_time_base = metadata["time_base"] / interpolation_factor
+
         try:
             encoder = RawFrameEncoder(
                 layout,
@@ -339,8 +379,8 @@ class DLSS5EnhanceVideoFile(io.ComfyNode):
                 quality=quality,
                 width=session.output_width,
                 height=session.output_height,
-                rate=metadata["rate"],
-                time_base=metadata["time_base"],
+                rate=output_rate,
+                time_base=output_time_base,
             )
 
             prepared_bytes = session.render_width * session.render_height * 8
@@ -418,30 +458,71 @@ class DLSS5EnhanceVideoFile(io.ComfyNode):
             producer.start()
             writer.start()
 
+            interpolator = (
+                FrameInterpolator(refine=interpolation_refine)
+                if interpolation_factor > 1
+                else None
+            )
             progress = ProgressBar(frame_count)
             written = 0
-            while True:
-                throw_exception_if_processing_interrupted()
-                if not errors.empty():
-                    raise errors.get()
-                try:
-                    item = prepared.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-                if item is _STOP:
-                    break
-                index, rgba, guide, pts = item
-                enhanced, out_pts = session.submit(
-                    index=index,
-                    rgba=rgba,
-                    motion=guide.motion,
-                    reset=guide.reset,
-                    pts=pts,
+            rendered_inputs = 0
+            previous_frame = None
+            previous_pts = 0
+            try:
+                while True:
+                    throw_exception_if_processing_interrupted()
+                    if not errors.empty():
+                        raise errors.get()
+                    try:
+                        item = prepared.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    if item is _STOP:
+                        break
+                    index, rgba, guide, pts = item
+                    enhanced, out_pts = session.submit(
+                        index=index,
+                        rgba=rgba,
+                        motion=guide.motion,
+                        reset=guide.reset,
+                        pts=pts,
+                    )
+                    timeline = [int(out_pts) * interpolation_factor]
+                    if interpolator is not None and previous_frame is not None:
+                        if guide.reset:
+                            # Scene cut: hold the outgoing frame instead of
+                            # blending two unrelated shots into a ghost.
+                            mids = [previous_frame] * (interpolation_factor - 1)
+                        else:
+                            mids = interpolator.between(
+                                previous_frame, enhanced, interpolation_factor
+                            )
+                        timeline = interpolated_timeline(
+                            previous_pts, out_pts, interpolation_factor
+                        )
+                        # Mid frames come first, then the real current frame.
+                        for mid, mid_pts in zip(mids, timeline[:-1]):
+                            if not offer(finished, (mid, mid_pts), True):
+                                break
+                            written += 1
+                    if not offer(finished, (enhanced, timeline[-1]), True):
+                        break
+                    written += 1
+                    rendered_inputs += 1
+                    previous_frame = enhanced
+                    previous_pts = out_pts
+                    progress.update(1)
+            finally:
+                if interpolator is not None:
+                    interpolator.close()
+
+            if interpolator is not None:
+                logger.info(
+                    "DLSS5: %dx frame interpolation added %d frame(s) via %s",
+                    interpolation_factor,
+                    interpolator.frames_generated,
+                    interpolator.describe(),
                 )
-                if not offer(finished, (enhanced, out_pts), True):
-                    break
-                written += 1
-                progress.update(1)
 
             offer(finished, _STOP, True)
             writer.join(timeout=_WRITER_TIMEOUT)
@@ -452,12 +533,12 @@ class DLSS5EnhanceVideoFile(io.ComfyNode):
             producer.join(timeout=30)
             if not errors.empty():
                 raise errors.get()
-            if written == 0:
+            if rendered_inputs == 0:
                 raise RuntimeError(f"No frames were decoded from {source.name}.")
-            if written != frame_count:
+            if rendered_inputs != frame_count:
                 message = (
-                    f"{source.name}: rendered {written} frames, the probe promised "
-                    f"{frame_count}."
+                    f"{source.name}: rendered {rendered_inputs} source frames, the "
+                    f"probe promised {frame_count}."
                 )
                 if counted_exactly:
                     raise RuntimeError(message + " The output would be truncated.")

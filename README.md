@@ -5,7 +5,8 @@ Run NVIDIA DLSS 5 Neural Rendering over your frames and videos, inside ComfyUI.
 DLSS 5 is NVIDIA's neural rendering pass. In a game it reconstructs the material and lighting
 detail that real-time rendering has to leave out, such as skin subsurface scattering, light
 transmission through hair and contact shadows, guided by the engine's own buffers. This node pack
-drives that same renderer over video frames and image batches, with optional 1.5x to 3x upscaling.
+drives that same renderer over video frames and image batches, with optional 1.5x to 3x
+upscaling, optical-flow frame interpolation and multi frame generation.
 Without those buffers what it recovers here is material response: skin, hair and fabric structure.
 
 It is not a filter that imitates the look. Frames go to the native renderer and come back
@@ -56,9 +57,10 @@ Encoded video carries no motion vectors, so they are estimated per frame with de
 cuts. Everything else is handled here: session setup, dimension negotiation, frame ordering,
 cancellation and diagnostics.
 
-The neural components themselves are NVIDIA, ReShade and RenoDX binaries. They are not part of
-this repository and are not redistributed by it. See
-[Licensing and attribution](#licensing-and-attribution).
+The Windows neural components are NVIDIA, ReShade and RenoDX binaries; they are not part of
+this repository and are not redistributed by it. The Linux pack does bundle NVIDIA's DLSS SDK
+pieces needed to build and run the native backend (`DLSS/`), under NVIDIA's DLSS terms rather
+than this project's MIT licence. See [Licensing and attribution](#licensing-and-attribution).
 
 ## Requirements
 
@@ -179,6 +181,47 @@ On Linux this prints `backend: native in-process DLSS-SR` and renders
 synthetic frames on the GPU. If NGX is unavailable the binding
 transparently falls back to Lanczos and says so in the feature report.
 
+### Frame interpolation (Linux)
+
+Both the video node and `DLSS5 Interpolate Images` can synthesise in-between frames. True DLSS
+Frame Generation needs a swapchain and NVIDIA's DLSS-G plugin; neither exists on Linux (the
+driver reports `FrameGeneration.Available = 0`), so the pack uses the GPU's NVIDIA Optical Flow
+Accelerator instead:
+
+1. `libnvidia-opticalflow.so` computes forward and backward flow between two source frames.
+2. Each new frame warps both neighbours along that flow and blends them, weighted by
+   forward/backward consistency so occluded pixels follow the frame that can still see them.
+3. With `neural_refine` on, the result goes through DLSS SuperSampling at 1x (DLAA) for the
+   neural material pass.
+
+So this is optical-flow interpolation with DLSS neural refinement, not DLSS-G. `2x`, `3x` and
+`4x` add one, two or three frames per source pair. Everything is GPU-resident and the flow
+buffer honours the driver's row pitch. In the video node the output frame rate and time base are
+scaled together, so the clip still ends on the last source frame: duration, audio sync,
+chapters and metadata are preserved to within one source frame.
+
+**Read this before judging the output:** the interpolator is verified on synthetic translations
+(exact shift recovered to RMSE < 1) and on real footage. It cannot invent detail that is absent
+from both neighbours. The video node detects scene cuts and holds the outgoing frame across a
+cut instead of blending two unrelated shots into a ghost.
+
+### Multi Frame Generation (MFG)
+
+`DLSS5 Multi Frame Generation` follows the DLSS-G MFG contract: from each pair of input frames it
+inserts one, two or three synthesised frames (`2x`, `3x`, `4x`). True DLSS-G needs a swapchain, so
+the node uses the same optical-flow engine and DLSS refinement described above. With a DLSS5
+Settings node connected it first neural-renders (and optionally upscales) the source frames, so the
+generated frames match the enhanced output; without Settings it only generates frames and leaves
+the source pixels untouched. With Settings connected, scene cuts hold the outgoing frame instead
+of blending two unrelated shots.
+
+From the second pair onward the generator also feeds the frame before the pair (N-2) into the
+interpolator. Flow is estimated for both N-2 -> N-1 and N-1 -> N, then each pixel follows a
+second-order trajectory: velocity is the central difference at N-1 and acceleration is the second
+difference. That keeps fast or accelerating motion on its curve instead of assuming a constant
+velocity between N-1 and N. The first pair, and any pair after a scene cut, falls back to pairwise
+flow because there is no valid N-2. Source frames are assumed to be equally spaced in time.
+
 ## Nodes
 
 ### DLSS5 Settings
@@ -222,6 +265,40 @@ terminating the worker on interruption.
 `verify_neural_rendering` (advanced, default on) fails the run when the ReShade log shows no
 signed feature-18 execution.
 
+### DLSS5 Interpolate Images
+
+`IMAGE` in, `IMAGE` out, plus the number of frames written. Input order is temporal: with `N`
+frames and a factor `F`, the output contains `(N - 1) * F + 1` frames, and each pair contributes
+its synthesised frames followed by the real next frame. That is the usual interpolation
+convention: the clip ends on the last real frame, so its duration is short by less than one
+source frame.
+
+| Input | Default | Notes |
+| --- | --- | --- |
+| `images` | required | Batch in playback order |
+| `multiplier` | 2x | 2x, 3x or 4x |
+| `neural_refine` | on | Pass each synthesised frame through 1x DLSS (DLAA) |
+
+A batch of one frame passes through unchanged. Unlike the video node there is no rate metadata
+to carry, so a downstream video combiner must use `source_fps * factor`.
+
+### DLSS5 Multi Frame Generation
+
+`IMAGE` in, `IMAGE` out, plus the total frame count and the number of generated frames. Input order
+is temporal, and with `N` frames and a factor `F` the output contains `(N - 1) * F + 1` frames.
+
+| Input | Default | Notes |
+| --- | --- | --- |
+| `images` | required | Batch in playback order |
+| `settings` | not connected | Optional. Connected: neural-render (and optionally upscale) the source frames first. Unconnected: only generate frames |
+| `multiplier` | 2x | 2x, 3x or 4x. Inserts one, two or three generated frames per pair |
+| `neural_refine` | on | Pass each generated frame through 1x DLSS (DLAA) |
+| `verify_neural_rendering` | on | Only applies with Settings connected; fails if feature 18 cannot be proven |
+
+This is the MFG contract implemented with the optical-flow backend, not DLSS-G, for the same
+swapchain reason as the interpolation node. A batch of one frame is returned unchanged (enhanced
+when Settings is connected) because there is no pair to generate between.
+
 ### DLSS5 Enhance Video File
 
 File in, file out. Decoding, neural rendering and encoding run concurrently through bounded
@@ -240,8 +317,11 @@ unchanged, while MP4 and MOV re-encode audio to AAC 192 kbit/s and drop subtitle
 | `max_frames` | 0 | 0 renders everything, any other value renders a preview of that many frames, up to 1000000 |
 | `copy_audio` | on | Mux the source audio into the result; subtitles only with MKV. Chapters and metadata are carried over either way |
 | `verify_neural_rendering` | on (advanced) | Check the ReShade log after the render. The file is written either way |
+| `frame_interpolation` | Off | Off, 2x, 3x, 4x. Adds 1, 2 or 3 synthesised frames per source pair and scales the output rate and time base to match |
+| `interpolation_neural_refine` | on (advanced) | Run every synthesised frame through 1x DLSS (DLAA). Off is faster and uses the raw flow warps |
 
-Outputs: the written path (`STRING`) and the number of rendered frames (`INT`).
+Outputs: the written path (`STRING`) and the number of written frames (`INT`), including
+interpolated frames.
 
 ## Recommended settings
 
@@ -425,8 +505,11 @@ ComfyUI-DLSS5-Enhancer/
     diagnostics.py       GPU checks, feature 18 proof, failure analysis
     imaging.py           IMAGE tensor and RGBA8 conversion, letterboxing
     media.py             Probing, decoding, NVENC encoding, muxing
+    interpolation.py     Optical-flow interpolation + DLSS refine, timeline maths
+    multiframe.py        Multi Frame Generation contract over the interpolation engine
     selftest.py          The smoke test itself
-  nodes/                 The three ComfyUI nodes
+  nodes/                 The five ComfyUI nodes
+  tests/                 Helper tests that need no GPU or ComfyUI
   config.json            Written by install_runtime.py, not tracked
   runtime/               Native runtime, not tracked
   ffmpeg/                Bundled ffmpeg, not tracked
@@ -439,12 +522,16 @@ inside it, so nothing is left behind.
 
 The source code in this repository is MIT licensed. See [LICENSE](LICENSE).
 
-The runtime it drives is not. Those files are NVIDIA, ReShade and RenoDX components plus the
-upstream project's own worker executable, each under its own terms: NVIDIA's DLSS and neural
+The runtime it drives is not. The Windows runtime is NVIDIA, ReShade and RenoDX components plus
+the upstream project's own worker executable, each under its own terms: NVIDIA's DLSS and neural
 rendering libraries are proprietary, ReShade is BSD-3-Clause, the RenoDX DLSS 5 add-on carries its
-own distribution terms, and the worker is built and licensed by the upstream project. Install only
-components you are authorised to use, from sources their licences permit. Nothing of that kind is
-hosted or redistributed here.
+own distribution terms, and the worker is built and licensed by the upstream project. None of that
+Windows runtime is included here.
+
+The Linux pack is self-contained but still bundles NVIDIA material under the DLSS SDK terms:
+`DLSS/include/`, `DLSS/lib/Linux_aarch64/libnvsdk_ngx.a` and
+`DLSS/lib/Linux_aarch64/rel/libnvidia-ngx-dlss.so.310.9.1`. Redistribute the pack only where
+those terms allow it; they are not MIT. The `nvofapi` headers are MIT (from dxvk-nvapi).
 
 The worker protocol was reimplemented for this pack. The runtime and the original application come
 from [Merserk/dlss5-visual-enhancer](https://github.com/Merserk/dlss5-visual-enhancer), which

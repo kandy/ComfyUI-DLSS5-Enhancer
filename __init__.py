@@ -4,7 +4,13 @@ from typing_extensions import override
 
 from comfy_api.latest import ComfyExtension, io
 
-from .nodes import DLSS5EnhanceImages, DLSS5EnhanceVideoFile, DLSS5SettingsNode
+from .nodes import (
+    DLSS5EnhanceImages,
+    DLSS5EnhanceVideoFile,
+    DLSS5InterpolateImages,
+    DLSS5MultiFrameGeneration,
+    DLSS5SettingsNode,
+)
 
 
 class Dlss5Extension(ComfyExtension):
@@ -14,6 +20,8 @@ class Dlss5Extension(ComfyExtension):
             DLSS5SettingsNode,
             DLSS5EnhanceImages,
             DLSS5EnhanceVideoFile,
+            DLSS5InterpolateImages,
+            DLSS5MultiFrameGeneration,
         ]
 
 
@@ -28,4 +36,6 @@ if False:
         "DLSS5Settings": DLSS5SettingsNode,
         "DLSS5EnhanceImages": DLSS5EnhanceImages,
         "DLSS5EnhanceVideoFile": DLSS5EnhanceVideoFile,
+        "DLSS5InterpolateImages": DLSS5InterpolateImages,
+        "DLSS5MultiFrameGeneration": DLSS5MultiFrameGeneration,
     }

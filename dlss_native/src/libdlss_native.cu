@@ -33,6 +33,7 @@
 #include <cstring>
 #include <cmath>
 #include <string>
+#include <vector>
 #include <pthread.h>
 #include <dlfcn.h>
 #include <unistd.h>
@@ -45,8 +46,16 @@
 #include "nvsdk_ngx.h"
 #include "nvsdk_ngx_defs.h"
 
-// Forward declaration (used by dladdr-based plugin path discovery below).
+// NVIDIA Optical Flow Accelerator (NVOFA) -- MIT-licensed SDK headers, vendored
+// under include/nvofapi. Used for flow-guided frame interpolation.
+#include "nvOpticalFlowCuda.h"
+#include "nvOpticalFlowCommon.h"
+
+// Forward declarations (dladdr uses dlss_init; interpolation refines with SR).
 extern "C" int32_t dlss_init(int32_t app_id);
+extern "C" int32_t dlss_upscale_rgba(const void *in, int32_t in_w, int32_t in_h,
+                                     void *out, int32_t out_w, int32_t out_h,
+                                     int32_t scale_x1000);
 
 // ---- result codes (mirror NVSDK_NGX_Result_Success == 1) -------------------
 #define DLSS_OK                 (int32_t)0x000001
@@ -93,6 +102,35 @@ struct NativeState {
     NgxFeat dlss;
 };
 static NativeState g;
+
+// ---- Optical-flow interpolation state --------------------------------------
+// NVOFA is loaded at runtime from the installed driver; the SDK headers only
+// define the interface. Everything degrades to a cross-fade when it is missing.
+struct OfSession {
+    bool ready = false;
+    int w = 0, h = 0;
+    NvOFHandle of = nullptr;
+    NV_OF_CUDA_API_FUNCTION_LIST fn = {};
+    NvOFGPUBufferHandle bufA = nullptr, bufB = nullptr;
+    NvOFGPUBufferHandle bufF = nullptr, bufW = nullptr;
+    NvOFGPUBufferHandle bufFPrev = nullptr, bufWPrev = nullptr;
+    CUdeviceptr pA = 0, pB = 0, pF = 0, pW = 0;
+    CUdeviceptr pFPrev = 0, pWPrev = 0;
+    uint32_t pitch_in = 0, pitch_out = 0;
+    uint8_t *d_out = nullptr; // w*h*4 warp target
+};
+
+struct InterpState {
+    int available = -1; // -1 = not probed, 1 = NVOFA usable, 0 = fallback
+    int last_path = 0;  // 1 = optical flow, 0 = linear cross-fade
+    int last_order = 0; // 2 = N-2/N-1/N acceleration-aware, 1 = pairwise, 0 = blend
+    void *lib = nullptr;
+    NV_OF_STATUS (*create)(uint32_t, NV_OF_CUDA_API_FUNCTION_LIST *) = nullptr;
+};
+
+static InterpState g_interp;
+static OfSession g_of;
+static pthread_mutex_t g_of_mu = PTHREAD_MUTEX_INITIALIZER;
 
 // ---- sRGB <-> linear -------------------------------------------------------
 __device__ __forceinline__ float dev_srgb_to_lin(float c) {
@@ -179,6 +217,336 @@ __global__ void k_upscale_rgba(const uint8_t *__restrict__ src,
         o[c] = (uint8_t)(acc[c] < 0.f ? 0.f : (acc[c] > 255.f ? 255.f : acc[c]));
 }
 
+// ---- Flow-guided interpolation kernels -------------------------------------
+// NVOFA returns S10.5 fixed-point vectors: 1/32 pixel per unit.
+__device__ __forceinline__ float2 dev_flow_at(const int16_t *f, int fw, int fh,
+                                              int pitch_px, float x, float y) {
+    x = fminf(fmaxf(x, 0.f), (float)(fw - 1));
+    y = fminf(fmaxf(y, 0.f), (float)(fh - 1));
+    const int x0 = (int)floorf(x), y0 = (int)floorf(y);
+    const int x1 = min(x0 + 1, fw - 1), y1 = min(y0 + 1, fh - 1);
+    const float fx = x - (float)x0, fy = y - (float)y0;
+    const int16_t *r0 = f + (size_t)y0 * pitch_px;
+    const int16_t *r1 = f + (size_t)y1 * pitch_px;
+    const float a0x = (float)r0[2 * x0], a0y = (float)r0[2 * x0 + 1];
+    const float a1x = (float)r0[2 * x1], a1y = (float)r0[2 * x1 + 1];
+    const float b0x = (float)r1[2 * x0], b0y = (float)r1[2 * x0 + 1];
+    const float b1x = (float)r1[2 * x1], b1y = (float)r1[2 * x1 + 1];
+    const float ax = (1.f - fx) * a0x + fx * a1x;
+    const float ay = (1.f - fx) * a0y + fx * a1y;
+    const float bx = (1.f - fx) * b0x + fx * b1x;
+    const float by = (1.f - fx) * b0y + fx * b1y;
+    return make_float2(((1.f - fy) * ax + fy * bx) * (1.f / 32.f),
+                       ((1.f - fy) * ay + fy * by) * (1.f / 32.f));
+}
+
+__device__ __forceinline__ bool dev_bilinear_rgba(const uint8_t *img, int w, int h,
+                                                  int pitch, float x, float y,
+                                                  float out[4]) {
+    if (x < 0.f || y < 0.f || x > (float)(w - 1) || y > (float)(h - 1)) return false;
+    const int x0 = (int)x, y0 = (int)y;
+    const int x1 = min(x0 + 1, w - 1), y1 = min(y0 + 1, h - 1);
+    const float fx = x - (float)x0, fy = y - (float)y0;
+    const uint8_t *r0 = img + (size_t)y0 * pitch;
+    const uint8_t *r1 = img + (size_t)y1 * pitch;
+    for (int c = 0; c < 4; ++c) {
+        const float a = (1.f - fx) * (float)r0[x0 * 4 + c] + fx * (float)r0[x1 * 4 + c];
+        const float b = (1.f - fx) * (float)r1[x0 * 4 + c] + fx * (float)r1[x1 * 4 + c];
+        out[c] = (1.f - fy) * a + fy * b;
+    }
+    return true;
+}
+
+// Bidirectional warp of A (t=0) and B (t=1) to time t, with a forward/
+// backward flow-consistency weight so disoccluded pixels take the frame that
+// actually sees them.
+__global__ void k_interp_warp(const uint8_t *__restrict__ A,
+                              const uint8_t *__restrict__ B,
+                              const int16_t *__restrict__ F,
+                              const int16_t *__restrict__ Bk,
+                              int w, int h, int pitch_a, int pitch_b,
+                              int fpitch_px, float t,
+                              uint8_t *__restrict__ out) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+
+    const float2 f = dev_flow_at(F, w, h, fpitch_px, (float)x, (float)y);
+    const float2 b = dev_flow_at(Bk, w, h, fpitch_px, (float)x, (float)y);
+
+    float ca[4], cb[4];
+    const bool va = dev_bilinear_rgba(A, w, h, pitch_a, (float)x - t * f.x,
+                                      (float)y - t * f.y, ca);
+    const bool vb = dev_bilinear_rgba(B, w, h, pitch_b, (float)x - (1.f - t) * b.x,
+                                      (float)y - (1.f - t) * b.y, cb);
+
+    const float2 b_at_a = dev_flow_at(Bk, w, h, fpitch_px,
+                                      (float)x + b.x, (float)y + b.y);
+    const float2 f_at_b = dev_flow_at(F, w, h, fpitch_px,
+                                      (float)x + f.x, (float)y + f.y);
+    const float e_a = hypotf(f.x + b_at_a.x, f.y + b_at_a.y);
+    const float e_b = hypotf(b.x + f_at_b.x, b.y + f_at_b.y);
+    const float sigma = 1.5f;
+    const float conf_a = expf(-(e_a * e_a) / (2.f * sigma * sigma));
+    const float conf_b = expf(-(e_b * e_b) / (2.f * sigma * sigma));
+
+    float w_a = va ? (1.f - t) * (0.15f + 0.85f * conf_a) : 0.f;
+    float w_b = vb ? t * (0.15f + 0.85f * conf_b) : 0.f;
+    float sum = w_a + w_b;
+    if (sum < 1e-4f) {
+        if (va && !vb) { w_a = 1.f; w_b = 0.f; sum = 1.f; }
+        else if (vb && !va) { w_a = 0.f; w_b = 1.f; sum = 1.f; }
+        else { w_a = 1.f - t; w_b = t; sum = 1.f; }
+    }
+
+    uint8_t *o = out + ((size_t)y * w + x) * 4;
+    for (int c = 0; c < 4; ++c) {
+        float v;
+        if (va && vb) v = (ca[c] * w_a + cb[c] * w_b) / sum;
+        else if (va) v = ca[c];
+        else if (vb) v = cb[c];
+        else v = (1.f - t) * (float)A[(size_t)y * pitch_a + x * 4 + c]
+               + t * (float)B[(size_t)y * pitch_b + x * 4 + c];
+        o[c] = (uint8_t)fminf(fmaxf(v + 0.5f, 0.f), 255.f);
+    }
+}
+
+// Acceleration-aware warp using three frames.  F is prev->next, Bk is
+// next->prev and BkPrev is prev->prev2, all sampled at the output pixel in the
+// prev frame.  With v0=(-BkPrev + F)/2 and acc=F+BkPrev, the trajectory
+// d(t)=v0*t+0.5*acc*t^2 passes through prev at t=0 and next at t=1 while
+// following the velocity and acceleration measured across the three frames.
+__global__ void k_interp_warp_3f(const uint8_t *__restrict__ A,
+                                 const uint8_t *__restrict__ B,
+                                 const int16_t *__restrict__ F,
+                                 const int16_t *__restrict__ Bk,
+                                 const int16_t *__restrict__ BkPrev,
+                                 int w, int h, int pitch_a, int pitch_b,
+                                 int fpitch_px, float t,
+                                 uint8_t *__restrict__ out) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+
+    const float2 f = dev_flow_at(F, w, h, fpitch_px, (float)x, (float)y);
+    const float2 b = dev_flow_at(Bk, w, h, fpitch_px, (float)x, (float)y);
+    const float2 bp = dev_flow_at(BkPrev, w, h, fpitch_px, (float)x, (float)y);
+
+    // v0 is the central-difference velocity at prev; acc is the second
+    // difference.  d(0)=0 and d(1)=f, so the trajectory still lands on next.
+    const float2 v0 = make_float2(0.5f * (f.x - bp.x), 0.5f * (f.y - bp.y));
+    const float2 acc = make_float2(f.x + bp.x, f.y + bp.y);
+    const float2 d = make_float2(v0.x * t + 0.5f * acc.x * t * t,
+                                 v0.y * t + 0.5f * acc.y * t * t);
+
+    // Displacement from next backward to time t.
+    const float2 back = make_float2(f.x - d.x, f.y - d.y);
+
+    float ca[4], cb[4];
+    const bool va = dev_bilinear_rgba(A, w, h, pitch_a, (float)x - d.x,
+                                      (float)y - d.y, ca);
+    const bool vb = dev_bilinear_rgba(B, w, h, pitch_b, (float)x + back.x,
+                                      (float)y + back.y, cb);
+
+    const float2 b_at_a = dev_flow_at(Bk, w, h, fpitch_px,
+                                      (float)x + b.x, (float)y + b.y);
+    const float2 f_at_b = dev_flow_at(F, w, h, fpitch_px,
+                                      (float)x + f.x, (float)y + f.y);
+    const float e_a = hypotf(f.x + b_at_a.x, f.y + b_at_a.y);
+    const float e_b = hypotf(b.x + f_at_b.x, b.y + f_at_b.y);
+    const float sigma = 1.5f;
+    const float conf_a = expf(-(e_a * e_a) / (2.f * sigma * sigma));
+    const float conf_b = expf(-(e_b * e_b) / (2.f * sigma * sigma));
+
+    float w_a = va ? (1.f - t) * (0.15f + 0.85f * conf_a) : 0.f;
+    float w_b = vb ? t * (0.15f + 0.85f * conf_b) : 0.f;
+    float sum = w_a + w_b;
+    if (sum < 1e-4f) {
+        if (va && !vb) { w_a = 1.f; w_b = 0.f; sum = 1.f; }
+        else if (vb && !va) { w_a = 0.f; w_b = 1.f; sum = 1.f; }
+        else { w_a = 1.f - t; w_b = t; sum = 1.f; }
+    }
+
+    uint8_t *o = out + ((size_t)y * w + x) * 4;
+    for (int c = 0; c < 4; ++c) {
+        float v;
+        if (va && vb) v = (ca[c] * w_a + cb[c] * w_b) / sum;
+        else if (va) v = ca[c];
+        else if (vb) v = cb[c];
+        else v = (1.f - t) * (float)A[(size_t)y * pitch_a + x * 4 + c]
+               + t * (float)B[(size_t)y * pitch_b + x * 4 + c];
+        o[c] = (uint8_t)fminf(fmaxf(v + 0.5f, 0.f), 255.f);
+    }
+}
+
+// Linear cross-fade used when NVOFA is not available.
+__global__ void k_interp_blend(const uint8_t *__restrict__ A,
+                               const uint8_t *__restrict__ B,
+                               int w, int h, float t,
+                               uint8_t *__restrict__ out) {
+    const size_t i = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i >= (size_t)w * h * 4) return;
+    for (int c = 0; c < 4; ++c) {
+        const float v = (1.f - t) * (float)A[i + c] + t * (float)B[i + c];
+        out[i + c] = (uint8_t)fminf(fmaxf(v + 0.5f, 0.f), 255.f);
+    }
+}
+
+// ---- NVOFA session management ----------------------------------------------
+static void of_release() {
+    if (g_of.fn.nvOFDestroyGPUBufferCuda) {
+        if (g_of.bufA) g_of.fn.nvOFDestroyGPUBufferCuda(g_of.bufA);
+        if (g_of.bufB) g_of.fn.nvOFDestroyGPUBufferCuda(g_of.bufB);
+        if (g_of.bufF) g_of.fn.nvOFDestroyGPUBufferCuda(g_of.bufF);
+        if (g_of.bufW) g_of.fn.nvOFDestroyGPUBufferCuda(g_of.bufW);
+        if (g_of.bufFPrev) g_of.fn.nvOFDestroyGPUBufferCuda(g_of.bufFPrev);
+        if (g_of.bufWPrev) g_of.fn.nvOFDestroyGPUBufferCuda(g_of.bufWPrev);
+    }
+    if (g_of.fn.nvOFDestroy && g_of.of) g_of.fn.nvOFDestroy(g_of.of);
+    if (g_of.d_out) cudaFree(g_of.d_out);
+    g_of = OfSession();
+}
+
+static bool of_load_library() {
+    if (g_interp.available >= 0) return g_interp.available > 0;
+    g_interp.available = 0;
+    static const char *names[] = {"libnvidia-opticalflow.so.1",
+                                  "libnvidia-opticalflow.so", nullptr};
+    for (int i = 0; names[i]; ++i) {
+        g_interp.lib = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
+        if (g_interp.lib) break;
+    }
+    if (!g_interp.lib) return false;
+    auto create = (NV_OF_STATUS (*)(uint32_t, NV_OF_CUDA_API_FUNCTION_LIST *))
+        dlsym(g_interp.lib, "NvOFAPICreateInstanceCuda");
+    if (!create) return false;
+    auto maxv = (NV_OF_STATUS (*)(uint32_t *))
+        dlsym(g_interp.lib, "NvOFGetMaxSupportedApiVersion");
+    if (maxv) {
+        uint32_t supported = 0;
+        if (maxv(&supported) == NV_OF_SUCCESS &&
+            (supported >> 4) < (NV_OF_API_VERSION >> 4))
+            return false;
+    }
+    g_interp.create = create;
+    g_interp.available = 1;
+    return true;
+}
+
+static bool of_execute_flow_into(const uint8_t *prev, const uint8_t *next,
+                                 int w, int h, uint32_t stride_in,
+                                 uint32_t stride_out,
+                                 NvOFGPUBufferHandle dstF,
+                                 NvOFGPUBufferHandle dstW,
+                                 CUdeviceptr pF, CUdeviceptr pW) {
+    if (cudaMemcpy2D((void *)g_of.pA, stride_in, prev, (size_t)w * 4,
+                     (size_t)w * 4, h, cudaMemcpyHostToDevice) != cudaSuccess)
+        return false;
+    if (cudaMemcpy2D((void *)g_of.pB, stride_in, next, (size_t)w * 4,
+                     (size_t)w * 4, h, cudaMemcpyHostToDevice) != cudaSuccess)
+        return false;
+    if (cudaMemset2D((void *)pF, stride_out, 0, (size_t)w * 4, h) != cudaSuccess)
+        return false;
+    if (cudaMemset2D((void *)pW, stride_out, 0, (size_t)w * 4, h) != cudaSuccess)
+        return false;
+
+    NV_OF_EXECUTE_INPUT_PARAMS in;
+    memset(&in, 0, sizeof(in));
+    in.inputFrame = g_of.bufA;
+    in.referenceFrame = g_of.bufB;
+    in.disableTemporalHints = NV_OF_TRUE; // frame pairs, not a live stream
+    NV_OF_EXECUTE_OUTPUT_PARAMS out;
+    memset(&out, 0, sizeof(out));
+    out.outputBuffer = dstF;
+    out.bwdOutputBuffer = dstW;
+
+    if (g_of.fn.nvOFExecute(g_of.of, &in, &out) != NV_OF_SUCCESS) return false;
+    return cudaDeviceSynchronize() == cudaSuccess;
+}
+
+static bool of_ensure(int w, int h) {
+    if (g_of.ready && g_of.w == w && g_of.h == h) return true;
+    of_release();
+    if (!of_load_library()) return false;
+
+    if (g_of.fn.nvCreateOpticalFlowCuda == nullptr) {
+        NV_OF_CUDA_API_FUNCTION_LIST list;
+        memset(&list, 0, sizeof(list));
+        if (g_interp.create(NV_OF_API_VERSION, &list) != NV_OF_SUCCESS) return false;
+        g_of.fn = list;
+    }
+    CUcontext ctx = nullptr;
+    if (cuCtxGetCurrent(&ctx) != CUDA_SUCCESS || !ctx) return false;
+    if (g_of.fn.nvCreateOpticalFlowCuda(ctx, &g_of.of) != NV_OF_SUCCESS) {
+        g_of.of = nullptr;
+        return false;
+    }
+
+    NV_OF_INIT_PARAMS init;
+    memset(&init, 0, sizeof(init));
+    init.width = (uint32_t)w;
+    init.height = (uint32_t)h;
+    init.outGridSize = NV_OF_OUTPUT_VECTOR_GRID_SIZE_1;
+    init.hintGridSize = NV_OF_HINT_VECTOR_GRID_SIZE_1;
+    init.mode = NV_OF_MODE_OPTICALFLOW;
+    init.perfLevel = NV_OF_PERF_LEVEL_MEDIUM;
+    init.enableExternalHints = NV_OF_FALSE;
+    init.enableOutputCost = NV_OF_FALSE;
+    init.hPrivData = nullptr;
+    init.disparityRange = NV_OF_STEREO_DISPARITY_RANGE_UNDEFINED;
+    init.enableRoi = NV_OF_FALSE;
+    init.predDirection = NV_OF_PRED_DIRECTION_BOTH;
+    init.enableGlobalFlow = NV_OF_FALSE;
+    init.inputBufferFormat = NV_OF_BUFFER_FORMAT_ABGR8;
+    if (g_of.fn.nvOFInit(g_of.of, &init) != NV_OF_SUCCESS) return false;
+
+    NV_OF_BUFFER_DESCRIPTOR bd;
+    memset(&bd, 0, sizeof(bd));
+    bd.width = (uint32_t)w;
+    bd.height = (uint32_t)h;
+    bd.bufferUsage = NV_OF_BUFFER_USAGE_INPUT;
+    bd.bufferFormat = NV_OF_BUFFER_FORMAT_ABGR8;
+    if (g_of.fn.nvOFCreateGPUBufferCuda(g_of.of, &bd, NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR,
+                                        &g_of.bufA) != NV_OF_SUCCESS) return false;
+    if (g_of.fn.nvOFCreateGPUBufferCuda(g_of.of, &bd, NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR,
+                                        &g_of.bufB) != NV_OF_SUCCESS) return false;
+    bd.bufferUsage = NV_OF_BUFFER_USAGE_OUTPUT;
+    bd.bufferFormat = NV_OF_BUFFER_FORMAT_SHORT2;
+    if (g_of.fn.nvOFCreateGPUBufferCuda(g_of.of, &bd, NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR,
+                                        &g_of.bufF) != NV_OF_SUCCESS) return false;
+    if (g_of.fn.nvOFCreateGPUBufferCuda(g_of.of, &bd, NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR,
+                                        &g_of.bufW) != NV_OF_SUCCESS) return false;
+    if (g_of.fn.nvOFCreateGPUBufferCuda(g_of.of, &bd, NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR,
+                                        &g_of.bufFPrev) != NV_OF_SUCCESS) return false;
+    if (g_of.fn.nvOFCreateGPUBufferCuda(g_of.of, &bd, NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR,
+                                        &g_of.bufWPrev) != NV_OF_SUCCESS) return false;
+
+    g_of.pA = g_of.fn.nvOFGPUBufferGetCUdeviceptr(g_of.bufA);
+    g_of.pB = g_of.fn.nvOFGPUBufferGetCUdeviceptr(g_of.bufB);
+    g_of.pF = g_of.fn.nvOFGPUBufferGetCUdeviceptr(g_of.bufF);
+    g_of.pW = g_of.fn.nvOFGPUBufferGetCUdeviceptr(g_of.bufW);
+    g_of.pFPrev = g_of.fn.nvOFGPUBufferGetCUdeviceptr(g_of.bufFPrev);
+    g_of.pWPrev = g_of.fn.nvOFGPUBufferGetCUdeviceptr(g_of.bufWPrev);
+
+    NV_OF_CUDA_BUFFER_STRIDE_INFO si;
+    memset(&si, 0, sizeof(si));
+    if (g_of.fn.nvOFGPUBufferGetStrideInfo(g_of.bufA, &si) != NV_OF_SUCCESS) return false;
+    g_of.pitch_in = si.strideInfo[0].strideXInBytes;
+    memset(&si, 0, sizeof(si));
+    if (g_of.fn.nvOFGPUBufferGetStrideInfo(g_of.bufF, &si) != NV_OF_SUCCESS) return false;
+    g_of.pitch_out = si.strideInfo[0].strideXInBytes;
+
+    if (cudaMalloc((void **)&g_of.d_out, (size_t)w * h * 4) != cudaSuccess) {
+        g_of.d_out = nullptr;
+        return false;
+    }
+    g_of.fn.nvOFSetIOCudaStreams(g_of.of, (CUstream)g.stream, (CUstream)g.stream);
+    g_of.w = w;
+    g_of.h = h;
+    g_of.ready = true;
+    return true;
+}
+
 // ---- NGX helpers (no exit() calls: library context) ------------------------
 static int quality_for_ratio(float r) {
     if (r < 1.2f) return QUALITY_DLAA;
@@ -208,12 +576,26 @@ static bool ngx_init_once() {
         size_t s = p.find_last_of('/');
         if (s != std::string::npos) dir = p.substr(0, s);
     }
-    static wchar_t wrel[4096], wdir[4096], wenv[4096];
-    mbstowcs(wrel, (dir + "/../../DLSS/lib/Linux_aarch64/rel").c_str(), 4095);
-    mbstowcs(wdir, dir.c_str(), 4095);
-    const wchar_t *paths[4];
+    // Try the bundled pack layout first, then the dev workspace and a copy
+    // dropped directly next to the .so. Only existing directories are listed.
+    static wchar_t wrel[5][4096], wdir[4096], wenv[4096];
+    const std::string candidates[4] = {
+        dir + "/../../DLSS/lib/Linux_aarch64/rel",                          // pack
+        dir + "/../DLSS/lib/Linux_aarch64/rel",                             // sibling
+        dir + "/../../ComfyUI-DLSS5-Enhancer/DLSS/lib/Linux_aarch64/rel",   // dev tree
+        dir + "/DLSS/lib/Linux_aarch64/rel",                                // local copy
+    };
+    const wchar_t *paths[7];
     int k = 0;
-    paths[k++] = wrel;
+    for (int i = 0; i < 4; ++i) {
+        struct stat st;
+        if (stat(candidates[i].c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+            mbstowcs(wrel[k], candidates[i].c_str(), 4095);
+            paths[k] = wrel[k];
+            ++k;
+        }
+    }
+    mbstowcs(wdir, dir.c_str(), 4095);
     paths[k++] = wdir;
     if (const char *env = getenv("DLSS_NGX_PLUGIN_DIR")) {
         if (env[0]) {
@@ -548,6 +930,7 @@ int32_t dlss_shutdown(void) {
     pthread_mutex_lock(&g_mu);
     if (g.initialised) {
         feat_free(&g.dlss);
+        of_release();
         if (g.ngx_available) {
             NVSDK_NGX_CUDA_Shutdown();
             g.ngx_available = false;
@@ -641,6 +1024,170 @@ int32_t dlss_upscale_rgba_ex(const void *in, int32_t in_w, int32_t in_h,
     g.last_path = neural ? 1 : 0;
     pthread_mutex_unlock(&g_mu);
     return rc;
+}
+
+// ---------------------------------------------------------------------------
+// Frame interpolation (NVIDIA Optical Flow Accelerator + DLSS refinement)
+// ---------------------------------------------------------------------------
+int32_t dlss_interpolate_available(void) {
+    pthread_mutex_lock(&g_of_mu);
+    const bool ok = of_load_library();
+    pthread_mutex_unlock(&g_of_mu);
+    return ok ? 1 : 0;
+}
+
+int32_t dlss_interp_last_path(void) { return g_interp.last_path; }
+
+int32_t dlss_interp_last_order(void) { return g_interp.last_order; }
+
+static void interp_refine_frames(void *out, int w, int h, int count) {
+    // DLSS-SR at 1x (DLAA) on each synthesised frame. This takes g_mu, so it
+    // must run outside g_of_mu. Failure is non-fatal: the warped frame is
+    // already valid.
+    const size_t frame_bytes = (size_t)w * h * 4;
+    std::vector<uint8_t> tmp(frame_bytes);
+    for (int k = 0; k < count; ++k) {
+        uint8_t *frame = (uint8_t *)out + (size_t)k * frame_bytes;
+        if (dlss_upscale_rgba(frame, w, h, tmp.data(), w, h, 1000) == DLSS_OK)
+            memcpy(frame, tmp.data(), frame_bytes);
+    }
+}
+
+// Generate `count` frames strictly between `prev` (t=0) and `next` (t=1).
+// out receives count * w * h * 4 RGBA8 bytes, in temporal order.
+// When prev2 is non-NULL the trajectory is estimated across
+// prev2 -> prev -> next: velocity is the central difference at prev and
+// acceleration is the second difference, so inserted frames follow curved /
+// accelerating motion instead of assuming a constant pairwise velocity.
+// refine != 0 runs each generated frame through the DLSS neural engine
+// (DLAA, 1x) to clean warp artefacts. Falls back to a linear cross-fade when
+// the optical-flow engine is unavailable; dlss_interp_last_path() reports it
+// and dlss_interp_last_order() reports 2/1/0.
+int32_t dlss_interpolate_rgba_3f(const void *prev2, const void *prev,
+                                 const void *next, int32_t w, int32_t h,
+                                 int32_t count, int32_t refine, void *out) {
+    if (!g.initialised) { set_err("not initialised"); return DLSS_ERR_NOT_INIT; }
+    if (!prev || !next || !out || w <= 0 || h <= 0 || count < 1 || count > 3) {
+        set_err("bad interpolation arguments");
+        return DLSS_ERR_BAD_INPUT;
+    }
+    if (w > 8192 || h > 8192) {
+        set_err("interpolation frame exceeds 8192 on an edge");
+        return DLSS_ERR_BAD_INPUT;
+    }
+    if (cudaSetDevice(0) != cudaSuccess || cudaFree(nullptr) != cudaSuccess) {
+        set_err("cannot establish CUDA context");
+        return DLSS_ERR_CUDA;
+    }
+
+    const size_t frame_bytes = (size_t)w * h * 4;
+    uint8_t *d_a = nullptr, *d_b = nullptr, *d_res = nullptr;
+    int pitch_a = w * 4, pitch_b = w * 4;
+    bool used_flow = false;
+    bool used_second_order = false;
+    bool ok = false;
+
+    pthread_mutex_lock(&g_of_mu);
+    if (of_ensure(w, h)) {
+        bool previous_ok = false;
+        if (prev2 != nullptr) {
+            previous_ok = of_execute_flow_into(
+                (const uint8_t *)prev2, (const uint8_t *)prev, w, h,
+                g_of.pitch_in, g_of.pitch_out,
+                g_of.bufFPrev, g_of.bufWPrev, g_of.pFPrev, g_of.pWPrev);
+        }
+
+        // Run the current pair last: g_of.pA/pB always hold prev and next for
+        // the warp kernels, while the previous pair stays in its own buffers.
+        bool current_ok = of_execute_flow_into(
+            (const uint8_t *)prev, (const uint8_t *)next, w, h,
+            g_of.pitch_in, g_of.pitch_out,
+            g_of.bufF, g_of.bufW, g_of.pF, g_of.pW);
+
+        if (current_ok) {
+            d_a = (uint8_t *)g_of.pA;
+            d_b = (uint8_t *)g_of.pB;
+            d_res = g_of.d_out;
+            pitch_a = pitch_b = (int)g_of.pitch_in;
+            used_flow = true;
+            used_second_order = previous_ok;
+        }
+    }
+
+    if (!used_flow) {
+        // No optical flow: upload both frames and cross-fade on the GPU.
+        if (cudaMalloc((void **)&d_a, frame_bytes) == cudaSuccess &&
+            cudaMalloc((void **)&d_b, frame_bytes) == cudaSuccess &&
+            cudaMalloc((void **)&d_res, frame_bytes) == cudaSuccess) {
+            if (cudaMemcpyAsync(d_a, prev, frame_bytes, cudaMemcpyHostToDevice,
+                                g.stream) != cudaSuccess ||
+                cudaMemcpyAsync(d_b, next, frame_bytes, cudaMemcpyHostToDevice,
+                                g.stream) != cudaSuccess ||
+                cudaStreamSynchronize(g.stream) != cudaSuccess) {
+                cudaFree(d_a); cudaFree(d_b); cudaFree(d_res);
+                d_a = d_b = d_res = nullptr;
+            }
+        } else {
+            if (d_a) cudaFree(d_a);
+            if (d_b) cudaFree(d_b);
+            if (d_res) cudaFree(d_res);
+            d_a = d_b = d_res = nullptr;
+        }
+    }
+
+    if (d_a && d_b && d_res) {
+        dim3 blk(16, 16);
+        dim3 grid((w + blk.x - 1) / blk.x, (h + blk.y - 1) / blk.y);
+        ok = true;
+        for (int k = 1; k <= count && ok; ++k) {
+            const float t = (float)k / (float)(count + 1);
+            if (used_second_order) {
+                k_interp_warp_3f<<<grid, blk, 0, g.stream>>>(
+                    d_a, d_b, (const int16_t *)g_of.pF,
+                    (const int16_t *)g_of.pW, (const int16_t *)g_of.pWPrev,
+                    w, h, pitch_a, pitch_b, (int)(g_of.pitch_out / 4), t, d_res);
+            } else if (used_flow) {
+                k_interp_warp<<<grid, blk, 0, g.stream>>>(
+                    d_a, d_b, (const int16_t *)g_of.pF,
+                    (const int16_t *)g_of.pW,
+                    w, h, pitch_a, pitch_b, (int)(g_of.pitch_out / 4), t, d_res);
+            } else {
+                const int total = w * h;
+                k_interp_blend<<<((total + 255) / 256), 256, 0, g.stream>>>(
+                    d_a, d_b, w, h, t, d_res);
+            }
+            if (cudaGetLastError() != cudaSuccess ||
+                cudaStreamSynchronize(g.stream) != cudaSuccess ||
+                cudaMemcpyAsync((uint8_t *)out + (size_t)(k - 1) * frame_bytes,
+                                d_res, frame_bytes, cudaMemcpyDeviceToHost,
+                                g.stream) != cudaSuccess ||
+                cudaStreamSynchronize(g.stream) != cudaSuccess)
+                ok = false;
+        }
+        if (!used_flow) {
+            cudaFree(d_a);
+            cudaFree(d_b);
+            cudaFree(d_res);
+        }
+    }
+    pthread_mutex_unlock(&g_of_mu);
+
+    if (!ok) {
+        set_err("frame interpolation failed");
+        return DLSS_ERR_CUDA;
+    }
+    g_interp.last_path = used_flow ? 1 : 0;
+    g_interp.last_order = used_second_order ? 2 : (used_flow ? 1 : 0);
+
+    if (refine)
+        interp_refine_frames(out, w, h, count);
+    return DLSS_OK;
+}
+
+int32_t dlss_interpolate_rgba(const void *prev, const void *next,
+                              int32_t w, int32_t h, int32_t count,
+                              int32_t refine, void *out) {
+    return dlss_interpolate_rgba_3f(nullptr, prev, next, w, h, count, refine, out);
 }
 
 // Legacy entrypoint: stills (zero motion, history reset), quality derived.
