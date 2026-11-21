@@ -30,8 +30,8 @@ from dlss5.paths import (  # noqa: E402  (path bootstrap must run first)
 )
 
 RELEASE_URL = (
-    "https://github.com/Merserk/dlss5-visual-enhancer/releases/download/3.0/"
-    "DLSS.5.Visual.Enhancer.v3.0.zip"
+        "https://github.com/Merserk/dlss5-visual-enhancer/releases/download/v4.0/"
+        "DLSS.5.Visual.Enhancer.v4.0.zip"
 )
 
 RUNTIME_TARGET = PACKAGE_ROOT / "runtime"

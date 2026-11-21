@@ -20,11 +20,8 @@
 //   On any NGX failure the call transparently falls back to the separable
 //   Lanczos-4 resizer below, and dlss_last_path() reports which path ran.
 //
-//   Build (aarch64/Linux):
-//     nvcc -O3 -arch=sm_120 -shared -o build/libdlss_native.so \
-//         src/libdlss_native.cu \
-//         -I ../../DLSS/include -L ../../DLSS/lib/Linux_aarch64 \
-//         -lnvsdk_ngx -ldl -lcuda -lcudart -Xcompiler -fPIC
+//   Build (auto-detect):  ./build.sh — host arch, GPU arch and CUDA toolkit
+//     are detected; ARCH, CUDA_HOME and DLSS_SDK_DIR override the values.
 // =============================================================================
 
 #include <cstdint>
@@ -566,8 +563,16 @@ static const char *hint_param_for_quality(int q) {
     }
 }
 
+static const char *ngx_lib_dir() {
+#if defined(__aarch64__)
+    return "Linux_aarch64";
+#else
+    return "Linux_x86_64";
+#endif
+}
+
 static bool ngx_init_once() {
-    // Resolve <repo>/DLSS/lib/Linux_aarch64/rel from this .so's location so
+    // Resolve <repo>/DLSS/lib/Linux_<arch>/rel from this .so's location so
     // installs anywhere on disk still find the DLSS plugin.
     Dl_info info;
     std::string dir = ".";
@@ -579,11 +584,12 @@ static bool ngx_init_once() {
     // Try the bundled pack layout first, then the dev workspace and a copy
     // dropped directly next to the .so. Only existing directories are listed.
     static wchar_t wrel[5][4096], wdir[4096], wenv[4096];
+    const std::string libdir = ngx_lib_dir();
     const std::string candidates[4] = {
-        dir + "/../../DLSS/lib/Linux_aarch64/rel",                          // pack
-        dir + "/../DLSS/lib/Linux_aarch64/rel",                             // sibling
-        dir + "/../../ComfyUI-DLSS5-Enhancer/DLSS/lib/Linux_aarch64/rel",   // dev tree
-        dir + "/DLSS/lib/Linux_aarch64/rel",                                // local copy
+        dir + "/../../DLSS/lib/" + libdir + "/rel",                        // pack
+        dir + "/../DLSS/lib/" + libdir + "/rel",                           // sibling
+        dir + "/../../ComfyUI-DLSS5-Enhancer/DLSS/lib/" + libdir + "/rel", // dev tree
+        dir + "/DLSS/lib/" + libdir + "/rel",                              // local copy
     };
     const wchar_t *paths[7];
     int k = 0;

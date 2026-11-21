@@ -70,7 +70,7 @@ than this project's MIT licence. See [Licensing and attribution](#licensing-and-
 | Driver | Current NVIDIA GeForce driver (590+ on Linux for the native backend) |
 | ComfyUI | A build with the V3 node API (`comfy_api.latest`) |
 | Python | `numpy`, `av` and OpenCV. ComfyUI portable normally ships all three; `opencv-python` is deliberately not in `requirements.txt` so it cannot overwrite an existing `opencv-contrib-python` |
-| Linux native backend | CUDA toolkit with `nvcc`, `libnvsdk_ngx.a` from the DLSS SDK archive, and the driver `libnvidia-ngx.so.1`. No Windows runtime download is needed |
+| Linux native backend | CUDA toolkit with `nvcc`, `libnvsdk_ngx.a` from the DLSS SDK, and the driver `libnvidia-ngx.so.1`. No Windows runtime download is needed |
 
 ## Installation
 
@@ -138,28 +138,38 @@ load normally and only fail when executed, with a message that says how to insta
 On Linux with an NVIDIA GPU, the nodes drive DLSS SuperSampling directly
 through the CUDA APIs (`NVSDK_NGX_CUDA_*`), in-process — no ReShade, no
 RenoDX, no `nvngx.dll` download. The pack ships the backend
-self-contained:
+self-contained. The `DLSS/` tree is a git checkout of
+https://github.com/NVIDIA/DLSS (the official DLSS SDK): `build.sh`
+clones it into `DLSS/` when it is missing, `DLSS_SDK_REPO` overrides
+the URL and `DLSS_SDK_DIR` points at an existing tree.
 
 ```
 ComfyUI-DLSS5-Enhancer/
   dlss_native/            # ctypes binding + prebuilt build/libdlss_native.so
     src/libdlss_native.cu # real DLSS-SR engine, Lanczos fallback
-    build.sh              # rebuild: needs nvcc + host CUDA toolkit
-  DLSS/
+    build.sh              # auto-detects host arch, GPU arch, CUDA toolkit
+  DLSS/                   # git checkout of https://github.com/NVIDIA/DLSS
     include/              # NGX SDK headers (rebuild only)
+    lib/Linux_x86_64/
+      libnvsdk_ngx.a      # NGX static wrapper (rebuild only)
+      rel/libnvidia-ngx-dlss.so.310.9.16   # DLSS model plugin (runtime)
     lib/Linux_aarch64/
       libnvsdk_ngx.a      # NGX static wrapper (rebuild only)
-      rel/libnvidia-ngx-dlss.so.310.9.1   # DLSS model plugin (runtime)
+      rel/libnvidia-ngx-dlss.so.310.9.16   # DLSS model plugin (runtime)
 ```
 
-At runtime only `dlss_native/build/libdlss_native.so`, the bundled
-`libnvidia-ngx-dlss.so.310.9.1` (found automatically next to the
-binding) and the host driver's `libnvidia-ngx.so.1` are needed. To
+At runtime only `dlss_native/build/libdlss_native.so`, the DLSS model
+plugin (`DLSS/lib/Linux_<arch>/rel/libnvidia-ngx-dlss.so`, found
+automatically) and the host driver's `libnvidia-ngx.so.1` are needed. To
 rebuild from source (e.g. a different CUDA toolkit):
 
 ```bash
 cd ComfyUI/custom_nodes/ComfyUI-DLSS5-Enhancer/dlss_native && ./build.sh
 ```
+
+`./build.sh` auto-detects the host arch, the GPU (via `nvidia-smi`) and the
+CUDA toolkit; set `ARCH`, `CUDA_HOME` or `DLSS_SDK_DIR` to override the
+detected values.
 
 The ComfyUI nodes pick the bundled binding up on Linux with no further
 configuration; per-frame motion vectors and history resets flow through
@@ -528,10 +538,13 @@ rendering libraries are proprietary, ReShade is BSD-3-Clause, the RenoDX DLSS 5 
 own distribution terms, and the worker is built and licensed by the upstream project. None of that
 Windows runtime is included here.
 
-The Linux pack is self-contained but still bundles NVIDIA material under the DLSS SDK terms:
-`DLSS/include/`, `DLSS/lib/Linux_aarch64/libnvsdk_ngx.a` and
-`DLSS/lib/Linux_aarch64/rel/libnvidia-ngx-dlss.so.310.9.1`. Redistribute the pack only where
-those terms allow it; they are not MIT. The `nvofapi` headers are MIT (from dxvk-nvapi).
+The Linux pack is self-contained: the `DLSS/` tree is a git checkout of the
+official DLSS SDK repo https://github.com/NVIDIA/DLSS. The NVIDIA
+material it carries — `DLSS/include/` (NGX SDK headers), the
+`libnvsdk_ngx.a` static wrappers and the `rel/libnvidia-ngx-dlss.so`
+model plugins — is under NVIDIA's DLSS terms, not this project's MIT
+licence. Redistribute the pack only where those terms allow it. The
+`nvofapi` headers are MIT (from dxvk-nvapi).
 
 The worker protocol was reimplemented for this pack. The runtime and the original application come
 from [Merserk/dlss5-visual-enhancer](https://github.com/Merserk/dlss5-visual-enhancer), which
